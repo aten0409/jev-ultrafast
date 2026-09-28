@@ -25,7 +25,7 @@
             <a href="/demo.mp4" target="_blank" rel="noopener">Watch the real Google Flights run ↗</a>
           </p>
         </div>
-        <div class="model-tag">jev-latest <span>+ text helper</span></div>
+        <div class="model-tag">Jev <span>+ text helper</span></div>
       </section>
       <form id="task-form">
         <div class="task-label">
@@ -34,11 +34,15 @@
             <option value="flights">Google Flights · real web</option>
             <option value="travel">Travel planner · fixture</option>
             <option value="research">Reading room · fixture</option>
+            <option value="custom">Custom website · real web</option>
           </select>
         </div>
+        <div id="custom-url-row" hidden>
+          <label for="start-url">Starting URL</label>
+          <input type="text" id="start-url" inputmode="url" placeholder="https://example.com" />
+        </div>
         <div class="task-row">
-          <textarea id="goal" name="goal" rows="5">
-Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.</textarea
+          <textarea id="goal" name="goal" rows="5"></textarea
           ><button type="submit" id="start" class="primary">
             Start demo <span>↗</span>
           </button>

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -10,7 +11,7 @@ from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
 class StalePage(ValueError):
@@ -20,12 +21,18 @@ class StalePage(ValueError):
 class Browser:
     def __init__(self, url):
         ensure_daemon()
+        if os.environ.get("JEV_BROWSER_MODE") == "personal":
+            user_agent = cdp("Browser.getVersion").get("userAgent", "")
+            if not user_agent or "HeadlessChrome" in user_agent:
+                raise RuntimeError("Personal Chrome mode did not connect to a visible Chrome browser")
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         self.call("Page.navigate", url=url)
+        if os.environ.get("JEV_DEDICATED_CHROME") == "1" or os.environ.get("JEV_BROWSER_MODE") == "personal":
+            self.call("Page.bringToFront")
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if self.evaluate("document.readyState") == "complete":

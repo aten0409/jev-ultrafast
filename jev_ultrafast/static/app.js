@@ -3,12 +3,18 @@ const token = document.querySelector('meta[name="demo-token"]').content;
 let state = null,
   busy = false,
   automatic = false;
+const departure = new Date();
+departure.setDate(departure.getDate() + 60);
+const flightDate = departure.toLocaleDateString("en-US", {
+  month: "long", day: "numeric", year: "numeric",
+});
 const goals = {
-  flights: 'Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.',
+  flights: `Find one-way flights from Zurich to London on ${flightDate}, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.`,
   travel: 'Find a Design stay in Lisbon with Free cancellation and open Casa Flora.',
   research:
     "Open the article about using finite choices to control browser agents.",
 };
+$("goal").value = goals.flights;
 const escape = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -34,6 +40,7 @@ function controls() {
   const live = state?.page && !["done", "blocked"].includes(state.status);
   $("start").disabled = busy;
   $("scenario").disabled = busy;
+  $("start-url").disabled = busy;
   $("goal").disabled = busy;
   $("choose").disabled = busy || !live;
   $("execute").disabled = busy || !state?.decision || !live;
@@ -150,12 +157,14 @@ $("task-form").addEventListener("submit", (event) => {
   automatic = false;
   perform(
     () =>
-      call("reset", { scenario: $("scenario").value, goal: $("goal").value }),
+      call("reset", { scenario: $("scenario").value, goal: $("goal").value, url: $("start-url").value }),
     "Opening a fresh browser…",
   );
 });
 $("scenario").addEventListener("change", () => {
-  $("goal").value = goals[$("scenario").value];
+  const scenario = $("scenario").value;
+  $("custom-url-row").hidden = scenario !== "custom";
+  if (goals[scenario]) $("goal").value = goals[scenario];
 });
 $("choose").addEventListener("click", () =>
   perform(() => call("predict"), "Jev is comparing the actions…"),

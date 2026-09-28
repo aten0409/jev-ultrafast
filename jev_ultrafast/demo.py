@@ -4,10 +4,17 @@ import atexit
 import json
 import os
 import secrets
+import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen
+
+from browser_harness.admin import daemon_alive
+from browser_harness.helpers import cdp
 
 from .agent import Agent
 from .questions import MAX_STEPS
@@ -20,13 +27,64 @@ LOCK = threading.Lock()
 AGENT = None
 
 
-def load_environment():
-    path = Path.cwd() / ".env"
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if "=" in line and not line.startswith("#"):
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key, value)
+def start_demo_chrome():
+    """Use an isolated Chrome for the Windows inspector, without changing the user's profile."""
+    if os.environ.get("JEV_BROWSER_MODE") == "personal":
+        return None
+    if sys.platform != "win32" or os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS"):
+        return None
+    if daemon_alive():
+        try:
+            cdp("Target.getTargets")
+            if "HeadlessChrome" in cdp("Browser.getVersion").get("userAgent", ""):
+                os.environ["JEV_DEDICATED_CHROME"] = "1"
+            return None
+        except (OSError, RuntimeError, TimeoutError):
+            pass
+    candidates = [
+        os.environ.get("BH_CHROME_PATH"),
+        str(Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe"),
+        str(
+            Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)"))
+            / "Google/Chrome/Application/chrome.exe"
+        ),
+    ]
+    chrome = next((path for path in candidates if path and Path(path).is_file()), None)
+    if chrome is None:
+        return None
+    profile = Path.cwd() / "artifacts" / "chrome-demo"
+    profile.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(
+        [chrome, "--headless=new", "--remote-debugging-port=0", f"--user-data-dir={profile}",
+         "--no-first-run", "about:blank"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    active_port = profile / "DevToolsActivePort"
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            port, ws_path = active_port.read_text(encoding="utf-8").splitlines()[:2]
+            port = int(port)
+            with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as response:
+                if json.load(response).get("webSocketDebuggerUrl", "").endswith(ws_path):
+                    os.environ["BU_CDP_URL"] = f"http://127.0.0.1:{port}"
+                    os.environ["JEV_DEDICATED_CHROME"] = "1"
+                    return process if process.poll() is None else None
+        except (FileNotFoundError, IndexError, OSError, ValueError):
+            pass
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    if process.poll() is None:
+        process.terminate()
+    raise RuntimeError("Dedicated Chrome did not expose a DevTools port; see artifacts/chrome-demo")
+
+
+def stop_demo_chrome(process):
+    if process.poll() is None:
+        process.terminate()
 
 
 def response_state():
@@ -41,20 +99,58 @@ def close_browser():
         AGENT = None
 
 
+def require_personal_chrome():
+    """Let Browser Harness discover the visible Chrome with its patient local handshake."""
+    if sys.platform != "win32":
+        raise RuntimeError("Personal Chrome mode currently supports Windows only")
+    if os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS"):
+        raise RuntimeError("Personal Chrome mode needs local discovery; remove BU_CDP_URL and BU_CDP_WS")
+    active = Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/User Data/DevToolsActivePort"
+    try:
+        port_text, ws_path = active.read_text(encoding="utf-8").splitlines()[:2]
+        port = int(port_text)
+        if not 0 < port < 65536 or not ws_path.startswith("/devtools/browser/"):
+            raise ValueError()
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        raise RuntimeError(
+            "Enable remote debugging in your Chrome at chrome://inspect/#remote-debugging, "
+            "approve Chrome's prompt, then start the task again."
+        ) from None
+
+
+def custom_start_url(raw):
+    url = raw.strip() if isinstance(raw, str) else ""
+    if not url or len(url) > 2048 or any(character.isspace() for character in url):
+        raise ValueError("Enter a full http:// or https:// starting URL")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Enter a full http:// or https:// starting URL without credentials")
+    try:
+        parsed.port
+    except ValueError:
+        raise ValueError("Enter a valid starting URL port") from None
+    return url
+
+
 def command(name, body):
     global AGENT
     if name == "reset":
         scenario = body.get("scenario", "flights")
-        if scenario not in {"travel", "research", "flights"}:
+        if scenario not in {"travel", "research", "flights", "custom"}:
             raise ValueError("Unknown demo scenario")
         goal = body.get("goal", "").strip()
         if not goal or len(goal) > 2000:
             raise ValueError("Enter 1–2,000 characters")
+        url = (
+            custom_start_url(body.get("url")) if scenario == "custom"
+            else "https://www.google.com/travel/flights?hl=en" if scenario == "flights"
+            else f"{ORIGIN}/fixture.html?scenario={scenario}"
+        )
+        if os.environ.get("JEV_BROWSER_MODE") == "personal":
+            require_personal_chrome()
         close_browser()
         AGENT = Agent(
-            "https://www.google.com/travel/flights?hl=en"
-            if scenario == "flights"
-            else f"{ORIGIN}/fixture.html?scenario={scenario}",
+            url,
             goal,
             screenshots=True,
             record_dir=Path.cwd() / "artifacts" / "frames" if body.get("record") else None,
@@ -98,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in files:
             return self.send(404, "Not found", "text/plain")
         name, mime = files[path]
-        content = (ROOT / "static" / name).read_text().replace("__TOKEN__", TOKEN)
+        content = (ROOT / "static" / name).read_text(encoding="utf-8").replace("__TOKEN__", TOKEN)
         self.send(200, content, mime + "; charset=utf-8")
 
     def do_POST(self):
@@ -129,7 +225,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    load_environment()
+    chrome = start_demo_chrome()
+    if chrome is not None:
+        atexit.register(stop_demo_chrome, chrome)
     atexit.register(close_browser)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Jev Ultrafast: {ORIGIN}", flush=True)

@@ -1,8 +1,14 @@
 """Offline contracts for a dynamic operation/target policy. No paid APIs."""
 
 import json
+import os
+import subprocess
+import sys
 import time
 from copy import deepcopy
+from datetime import date
+from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -10,6 +16,31 @@ import pytest
 from jev_ultrafast import agent as loop
 from jev_ultrafast import model
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
+
+
+@pytest.mark.parametrize("external_name", [None, "already_set"])
+def test_env_loads_before_browser_harness_import(tmp_path, external_name):
+    (tmp_path / ".env").write_text(
+        "BU_NAME=from_file\nTYPESAFE_DEMO_PORT=8877\nTEXT_MODEL='from-file-model'\n", encoding="utf-8"
+    )
+    environment = os.environ.copy()
+    environment.pop("BU_NAME", None)
+    environment.pop("TYPESAFE_DEMO_PORT", None)
+    environment.pop("TEXT_MODEL", None)
+    if external_name:
+        environment["BU_NAME"] = external_name
+    script = (
+        "import json, os; "
+        "from jev_ultrafast import demo; "
+        "from browser_harness import admin, helpers; "
+        "print(json.dumps([admin.NAME, helpers.NAME, demo.PORT, os.environ['TEXT_MODEL']]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=True,
+    )
+    expected_name = external_name or "from_file"
+    assert json.loads(result.stdout) == [expected_name, expected_name, 8877, "from-file-model"]
 
 
 def page():
@@ -186,6 +217,26 @@ def test_stale_decision_is_consumed_before_any_mutation(runner):
     assert runner.state["decision"] is None
 
 
+def test_text_generation_checks_the_observed_page(runner, monkeypatch):
+    runner.state["browser"].fresh.side_effect = lambda _page, action=None: action is None
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("book", {"model": "test", "latency_ms": 10})))
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].fresh.assert_called_once_with(runner.state["page"])
+    runner.state["browser"].act.assert_called_once()
+
+
+def test_fill_freshness_rejects_changed_page_text(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    observed = {"page_key": ["unchanged form"], "guards": {"10": ["unchanged field"]}, "marker": ["old text"]}
+    candidate = browser.Browser.__new__(browser.Browser)
+    evaluate = Mock(return_value=["new text"])
+    monkeypatch.setattr(candidate, "evaluate", evaluate)
+    assert not candidate.fresh(observed, {"kind": "fill", "node": 10})
+    assert evaluate.call_count == 1
+    assert evaluate.call_args.args[0] == browser.MARKER
+
+
 def test_generated_text_reused_only_for_identical_retry_context(runner, monkeypatch):
     helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
     monkeypatch.setattr(loop, "field_text", helper)
@@ -237,6 +288,197 @@ def test_observation_is_one_atomic_browser_read(monkeypatch):
     assert actual["actions"] == p["actions"]
     assert cdp.call_count == 1
     assert cdp.call_args.args[0] == "Runtime.evaluate"
+
+
+def test_windows_demo_starts_an_isolated_chrome(monkeypatch, tmp_path):
+    from jev_ultrafast import demo
+
+    monkeypatch.delenv("JEV_BROWSER_MODE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(demo, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(demo.subprocess, "CREATE_NO_WINDOW", 0, raising=False)
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    chrome = tmp_path / "chrome.exe"
+    chrome.touch()
+    monkeypatch.setenv("BH_CHROME_PATH", str(chrome))
+    active = tmp_path / "artifacts" / "chrome-demo" / "DevToolsActivePort"
+    active.parent.mkdir(parents=True)
+    active.write_text("9333\n/devtools/browser/test\n", encoding="utf-8")
+    process = Mock()
+    process.poll.return_value = None
+    spawn = Mock(return_value=process)
+    monkeypatch.setattr(demo.subprocess, "Popen", spawn)
+    monkeypatch.setattr(demo, "daemon_alive", lambda: False)
+    monkeypatch.setattr(
+        demo, "urlopen",
+        lambda *_args, **_kwargs: BytesIO(b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/browser/test"}'),
+    )
+
+    assert demo.start_demo_chrome() is process
+    assert os.environ["BU_CDP_URL"] == "http://127.0.0.1:9333"
+    assert os.environ["JEV_DEDICATED_CHROME"] == "1"
+    assert "--headless=new" in spawn.call_args.args[0]
+    assert f"--user-data-dir={active.parent}" in spawn.call_args.args[0]
+
+
+def test_windows_demo_reuses_a_healthy_browser_daemon(monkeypatch):
+    from jev_ultrafast import demo
+
+    monkeypatch.delenv("JEV_BROWSER_MODE", raising=False)
+    monkeypatch.setattr(demo, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.delenv("JEV_DEDICATED_CHROME", raising=False)
+    monkeypatch.setattr(demo, "daemon_alive", lambda: True)
+    probe = Mock(side_effect=[{"targetInfos": []}, {"userAgent": "HeadlessChrome/153.0"}])
+    monkeypatch.setattr(demo, "cdp", probe)
+    spawn = Mock()
+    monkeypatch.setattr(demo.subprocess, "Popen", spawn)
+    assert demo.start_demo_chrome() is None
+    assert [call.args[0] for call in probe.call_args_list] == ["Target.getTargets", "Browser.getVersion"]
+    assert os.environ["JEV_DEDICATED_CHROME"] == "1"
+    spawn.assert_not_called()
+
+
+def test_personal_mode_never_starts_an_isolated_chrome(monkeypatch):
+    from jev_ultrafast import demo
+
+    monkeypatch.setenv("JEV_BROWSER_MODE", "personal")
+    spawn = Mock()
+    monkeypatch.setattr(demo.subprocess, "Popen", spawn)
+    assert demo.start_demo_chrome() is None
+    spawn.assert_not_called()
+
+
+def test_personal_mode_uses_local_chrome_discovery(monkeypatch, tmp_path):
+    from jev_ultrafast import demo
+
+    monkeypatch.setattr(demo, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    active = tmp_path / "Google" / "Chrome" / "User Data" / "DevToolsActivePort"
+    active.parent.mkdir(parents=True)
+    active.write_text("9333\n/devtools/browser/visible\n", encoding="utf-8")
+    demo.require_personal_chrome()
+    assert "BU_CDP_WS" not in os.environ
+    assert "BU_CDP_URL" not in os.environ
+
+
+def test_personal_mode_requires_chrome_debugging_permission(monkeypatch, tmp_path):
+    from jev_ultrafast import demo
+
+    monkeypatch.setattr(demo, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    with pytest.raises(RuntimeError, match="chrome://inspect/#remote-debugging"):
+        demo.require_personal_chrome()
+    assert "BU_CDP_WS" not in os.environ
+
+
+@pytest.mark.parametrize("variable", ["BU_CDP_WS", "BU_CDP_URL"])
+def test_personal_mode_rejects_explicit_remote_endpoint(monkeypatch, variable):
+    from jev_ultrafast import demo
+
+    monkeypatch.setattr(demo, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.setenv(variable, "ws://127.0.0.1:9222/devtools/browser/stale")
+    with pytest.raises(RuntimeError, match="local discovery"):
+        demo.require_personal_chrome()
+
+
+@pytest.mark.parametrize("url", ["https://shopee.co.th/", "https://www.lazada.co.th/a?b=1", "http://localhost:8766/"])
+def test_custom_start_url_accepts_web_addresses(url):
+    from jev_ultrafast.demo import custom_start_url
+
+    assert custom_start_url(url) == url
+
+
+@pytest.mark.parametrize("url", ["", "shopee.co.th", "file:///etc/passwd", "https://user:pass@shop.test/",
+                                  "https://shop.test:bad/", "https://shop.test/a b"])
+def test_custom_start_url_rejects_invalid_addresses(url):
+    from jev_ultrafast.demo import custom_start_url
+
+    with pytest.raises(ValueError, match="starting URL"):
+        custom_start_url(url)
+
+
+def test_custom_reset_uses_given_url_and_goal(monkeypatch):
+    from jev_ultrafast import demo
+
+    monkeypatch.delenv("JEV_BROWSER_MODE", raising=False)
+    monkeypatch.setattr(demo, "AGENT", None)
+    agent = Mock()
+    agent.state = {}
+    agent.snapshot.return_value = {"status": "ready"}
+    factory = Mock(return_value=agent)
+    monkeypatch.setattr(demo, "Agent", factory)
+    result = demo.command("reset", {"scenario": "custom", "url": "https://www.lazada.co.th/", "goal": "Find a mug"})
+    assert factory.call_args.args == ("https://www.lazada.co.th/", "Find a mug")
+    assert agent.state["scenario"] == "custom"
+    assert result["status"] == "ready"
+
+
+@pytest.mark.parametrize("dedicated", [False, True])
+def test_only_dedicated_demo_tab_is_brought_to_front(monkeypatch, dedicated):
+    import jev_ultrafast.browser as browser
+
+    monkeypatch.delenv("JEV_BROWSER_MODE", raising=False)
+    if dedicated:
+        monkeypatch.setenv("JEV_DEDICATED_CHROME", "1")
+    else:
+        monkeypatch.delenv("JEV_DEDICATED_CHROME", raising=False)
+    calls = []
+
+    def fake_cdp(method, **_kwargs):
+        calls.append(method)
+        if method == "Target.createTarget":
+            return {"targetId": "target"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "session"}
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    monkeypatch.setattr(browser, "ensure_daemon", Mock())
+    monkeypatch.setattr(browser.Browser, "evaluate", lambda _self, _expression: "complete")
+    browser.Browser("https://example.test")
+    assert ("Page.bringToFront" in calls) is dedicated
+
+
+@pytest.mark.parametrize("user_agent", ["HeadlessChrome/153.0", ""])
+def test_personal_mode_rejects_headless_or_unknown_chrome(monkeypatch, user_agent):
+    import jev_ultrafast.browser as browser
+
+    monkeypatch.setenv("JEV_BROWSER_MODE", "personal")
+    monkeypatch.setattr(browser, "ensure_daemon", Mock())
+    cdp = Mock(return_value={"userAgent": user_agent})
+    monkeypatch.setattr(browser, "cdp", cdp)
+    with pytest.raises(RuntimeError, match="visible Chrome"):
+        browser.Browser("https://example.test")
+    assert cdp.call_args.args == ("Browser.getVersion",)
+
+
+def test_personal_mode_brings_owned_tab_to_front(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    monkeypatch.setenv("JEV_BROWSER_MODE", "personal")
+    monkeypatch.delenv("JEV_DEDICATED_CHROME", raising=False)
+    calls = []
+
+    def fake_cdp(method, **_kwargs):
+        calls.append(method)
+        return {"Browser.getVersion": {"userAgent": "Chrome/153.0"},
+                "Target.createTarget": {"targetId": "target"},
+                "Target.attachToTarget": {"sessionId": "session"}}.get(method, {})
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    monkeypatch.setattr(browser, "ensure_daemon", Mock())
+    monkeypatch.setattr(browser.Browser, "evaluate", lambda _self, _expression: "complete")
+    browser.Browser("https://example.test")
+    assert "Page.bringToFront" in calls
 
 
 def test_executor_rejects_a_stale_page_before_browser_input(monkeypatch):
@@ -294,12 +536,12 @@ def test_flight_verification_rejects_wrong_trip(changed):
             ]
         ],
     }
-    assert verify(actual)["passed"]
+    assert verify(actual, date(2026, 9, 20))["passed"]
     if changed == "year":
         actual["text"] = actual["text"].replace("2026", "2027")
     else:
         next(a for a in actual["actions"] if a["label"] == changed)["value"] = "wrong"
-    assert not verify(actual)["passed"]
+    assert not verify(actual, date(2026, 9, 20))["passed"]
 
 
 @pytest.mark.parametrize(
